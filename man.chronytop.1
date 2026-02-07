@@ -1,0 +1,291 @@
+.TH CHRONYTOP 1 "February 2026" "chronytop 1.0" "User Commands"
+.SH NAME
+chronytop \- real-time monitoring for chrony time synchronization
+.SH SYNOPSIS
+.B chronytop
+.SH DESCRIPTION
+.B chronytop
+is a terminal-based monitoring tool for the chrony NTP daemon, inspired by
+.BR top (1).
+It provides real-time visualization of system clock offset, frequency drift,
+jitter, NTP source health, and CPU temperature in an intuitive ncurses interface.
+
+chronytop displays live sparkline graphs of key timekeeping metrics, evaluates
+NTP source trustworthiness with a comprehensive scoring system, and provides
+automated health alerts for common time synchronization issues.
+
+.SH FEATURES
+.TP
+.B Real-time tracking metrics
+Displays system time offset, RMS jitter, frequency drift, and skew with
+continuous updates.
+.TP
+.B Live sparkline graphs
+Visual representation of offset, RMS, frequency, skew, and CPU temperature
+over a 2-minute rolling window. Supports both fixed and autoscaling modes.
+.TP
+.B NTP source analysis
+Evaluates each configured NTP source with trust scoring (0-100) based on
+reachability, offset magnitude, standard deviation, frequency skew, and
+stratum. Includes 8-bit reach visualization showing recent poll history.
+.TP
+.B Network noise detection
+Compares selected source standard deviation against median of all sources
+to identify outlier network conditions.
+.TP
+.B CPU temperature monitoring
+Tracks package temperatures via coretemp hwmon sensors with automatic
+fallback to thermal zones. Displays temperature-frequency coupling analysis
+to detect thermal compensation effects.
+.TP
+.B Health monitoring
+Automated alerts for chronyd daemon failures, large offsets, high jitter,
+excessive drift, oscillator instability, time jumps, and suspend/resume events.
+.TP
+.B Intelligent rate limiting
+Reduces overhead by caching chronyc results: tracking (1s), sources (5s),
+sourcestats (20s). Failed commands retain previous successful results.
+
+.SH INTERACTIVE COMMANDS
+.TP
+.B q
+Quit chronytop.
+.TP
+.B a
+Toggle autoscaling mode for graphs. When enabled, graph scales dynamically
+adjust based on recent data (2-minute window). When disabled (default), uses
+fixed scales: ±50ms offset, 0-50ms RMS, ±100ppm frequency, 0-20ppm skew,
+20-90°C temperature. Values exceeding visible range are clipped and indicated
+with ▲ (above) or ▼ (below) symbols.
+
+.SH DISPLAY SECTIONS
+
+.SS Tracking Metrics
+.TP
+.B Offset
+How far the system clock is from true time. Displayed in milliseconds with
+sign. Normal range: ±10ms. Values >50ms trigger alerts.
+.TP
+.B RMS
+Root mean square of offset measurements, indicating jitter or noise.
+Displayed in milliseconds. Normal range: <5ms. Values >10ms indicate
+network or source instability.
+.TP
+.B Freq
+Frequency correction being applied in parts per million (ppm). Represents
+the rate adjustment needed to keep the clock accurate. Normal range: ±20ppm.
+Values >100ppm suggest oscillator problems or extreme temperature changes.
+.TP
+.B Skew
+Estimated error in the frequency measurement in ppm. Indicates how confident
+chrony is about the frequency correction. Normal range: <1ppm. Values >5ppm
+suggest unstable measurements or changing conditions.
+
+.SS Source Trust Scoring
+Each NTP source receives a score from 0-100:
+.TP
+.B 80-100 (Green)
+Excellent source. Low jitter, good reachability, stable measurements.
+.TP
+.B 55-79 (Yellow)
+Fair source. Some issues but usable. May have elevated jitter or
+occasional reachability problems.
+.TP
+.B 0-54 (Red)
+Poor source. High jitter, unreachable, stale, or providing inconsistent time.
+Likely a falseticker.
+
+.SS Source Flags
+.TP
+.B UNREACHABLE
+Cannot contact source (network issue or server down).
+.TP
+.B BAD
+Source marked bad by chrony (consistently wrong time).
+.TP
+.B TOO_VAR
+Source shows too much variance in measurements.
+.TP
+.B STALE
+Haven't received update recently (last_rx > 256s).
+.TP
+.B REACH=0
+Reachability register is zero (no successful polls in last 8 attempts).
+.TP
+.B OFF>Xms
+Offset exceeds threshold (10ms or 50ms).
+.TP
+.B ERR>Xms
+Estimated error exceeds threshold (10ms, 50ms, or 100ms).
+.TP
+.B SD>Xms
+Standard deviation exceeds threshold (1ms, 5ms, or 15ms).
+.TP
+.B FSKEW>X
+Frequency skew exceeds threshold (0.5, 1.0, or 2.0 ppm).
+.TP
+.B FALSETICKER?
+Likely providing incorrect time based on multiple indicators.
+
+.SS Reach Visualization
+Eight dots showing recent poll attempts, newest on left:
+.TP
+.B ●
+Successful poll
+.TP
+.B ○
+Failed poll
+.PP
+Example: ●●●●○○○○ indicates 4 recent successes followed by 4 failures.
+
+.SS Network Noise Indicator
+.TP
+.B OK (Green)
+Selected source standard deviation is reasonable compared to other sources.
+.TP
+.B ELEVATED (Yellow)
+Selected source SD is 2x median + 0.2ms gap. May indicate network issues.
+.TP
+.B OUTLIER (Red)
+Selected source SD is 3x median + 0.5ms gap. Significant network problems
+or poor source quality.
+
+.SS Health Alerts
+.TP
+.B CHRONYD DOWN / NO DATA
+chronyd daemon not running or not responding to chronyc commands.
+.TP
+.B NO SOURCES
+No NTP sources configured in chrony.conf.
+.TP
+.B NO REACHABLE SOURCES
+All configured sources are unreachable.
+.TP
+.B NO SELECTED SOURCE
+chronyd hasn't selected a reference source for synchronization.
+.TP
+.B CLOCK STEP / LARGE OFFSET
+System clock offset exceeds 50ms. May indicate clock step or serious drift.
+.TP
+.B HIGH OFFSET
+System clock offset exceeds 10ms but is below step threshold.
+.TP
+.B JITTER (RMS HIGH)
+RMS offset exceeds 10ms, indicating excessive jitter or noise.
+.TP
+.B DRIFT (FREQ HIGH)
+Frequency correction exceeds 100ppm. May indicate oscillator problems or
+extreme temperature changes.
+.TP
+.B UNSTABLE OSC (SKEW HIGH)
+Skew exceeds 5ppm, indicating unstable frequency measurements.
+.TP
+.B TIME JUMP (OFFSET DELTA)
+Large sudden change in offset detected (>250ms between samples).
+.TP
+.B SUSPEND/PAUSE DETECTED (MONOTONIC GAP)
+Monotonic clock gap detected (>15s), indicating system suspend or pause.
+.TP
+.B STALE DATA
+chronyc commands timing out or returning stale information.
+
+.SH REQUIREMENTS
+.TP
+.B chrony
+The chrony NTP daemon must be installed and running. Available at
+https://chrony.tuxfamily.org/
+.TP
+.B Python 3.6+
+Standard library only (curses, subprocess, time, re, statistics, os, glob).
+.TP
+.B Linux
+Requires sysfs access for CPU temperature monitoring. May work on other
+Unix-like systems with limited functionality.
+.TP
+.B Permissions
+Must be able to execute
+.BR chronyc (1)
+commands. May require sudo for accessing chronyd socket depending on system
+configuration.
+
+.SH FILES
+.TP
+.I /var/run/chrony/chronyd.sock
+Unix domain socket for chronyc communication (typical location).
+.TP
+.I /sys/class/hwmon/hwmon*/
+Hardware monitoring sensors for CPU temperature (coretemp preferred).
+.TP
+.I /sys/class/thermal/thermal_zone*/
+Thermal zone sensors (fallback for CPU temperature).
+
+.SH EXAMPLES
+.TP
+Run chronytop with regular user privileges:
+.B chronytop
+.TP
+Run with sudo if chronyc requires elevated permissions:
+.B sudo chronytop
+
+.SH DIAGNOSTICS
+.TP
+.B "chronyc not found / not executable"
+Install chrony package or ensure chronyc is in PATH. On Debian/Ubuntu:
+apt install chrony. On RHEL/CentOS: yum install chrony.
+.TP
+.B "No sources parsed"
+Check if chronyd is running (systemctl status chronyd) and verify NTP sources
+are configured in /etc/chrony/chrony.conf.
+.TP
+.B "CPU Temp: - (no readable sensors)"
+System doesn't expose temperature sensors via sysfs (common in VMs).
+chronytop will retry discovery every 60 seconds. Check manually with:
+cat /sys/class/hwmon/hwmon*/name
+.TP
+.B "Updates are too slow (17+ minutes)"
+chrony polling interval is at maximum (1024s). Edit /etc/chrony/chrony.conf
+and add to server lines: minpoll 4 maxpoll 6. Then restart chronyd.
+
+.SH PERFORMANCE
+chronytop uses intelligent rate limiting to minimize overhead:
+.TP
+.B tracking
+Polled every 1 second (lightweight, essential for real-time monitoring)
+.TP
+.B sources -v
+Polled every 5 seconds (moderately expensive)
+.TP
+.B sourcestats -v
+Polled every 20 seconds (expensive, changes slowly)
+.PP
+Failed commands retain previous successful results, so transient issues
+don't disrupt the display. Total CPU usage is typically <1% on modern systems.
+
+.SH BUGS
+Temperature monitoring requires sysfs access and may not work on all systems.
+VMs typically don't expose temperature sensors.
+
+Extremely long source names (>24 chars) are truncated in the display.
+
+Graph autoscaling may not provide optimal ranges for highly variable data.
+
+Report bugs at: https://github.com/aimana007/ChronyTop/issues
+
+.SH AUTHOR
+Written by AimanA007.
+
+.SH COPYRIGHT
+Copyright © 2026 Aiman Al-Khazaali.
+License: MIT License.
+
+.SH SEE ALSO
+.BR chronyc (1),
+.BR chronyd (8),
+.BR top (1),
+.BR htop (1),
+.BR ntpq (1),
+.BR timedatectl (1)
+
+Online documentation: https://github.com/aimana007/ChronyTop/
+
+chrony documentation: https://chrony.tuxfamily.org/documentation.html
