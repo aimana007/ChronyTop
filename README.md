@@ -2,7 +2,7 @@
 
 A real-time terminal monitoring tool for `chrony` time synchronization, inspired by `top`. ChronyTop provides live visualization of clock offset, frequency drift, jitter, and NTP source health with an intuitive ncurses interface.
 
-![ChronyTop Screenshot](screenshot.png)
+![ChronyTop Screenshot](blob/main/screenshot.png)
 
 ## Features
 
