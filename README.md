@@ -8,9 +8,10 @@ A real-time terminal monitoring tool for `chrony` time synchronization, inspired
 
 ### Core Monitoring
 - **Real-time tracking metrics**: System time offset, RMS jitter, frequency drift, and skew
-- **Live sparkline graphs**: Visual representation of offset, RMS, frequency, and skew over time
-- **CPU temperature monitoring**: Tracks package temperatures via `coretemp` hwmon sensors with thermal zone fallback
+- **Live sparkline graphs**: Visual representation of offset, RMS, frequency, and skew over time with optional autoscaling (toggle with `a`)
+- **CPU temperature monitoring**: Tracks package temperatures via `coretemp` hwmon sensors with thermal zone fallback and automatic rediscovery
 - **Temperature-frequency coupling analysis**: Detects correlations between CPU temperature changes and clock drift
+- **Intelligent rate limiting**: Reduces chronyc overhead with cached results (tracking: 1s, sources: 5s, sourcestats: 20s)
 
 ### NTP Source Analysis
 - **Comprehensive source trust scoring**: Evaluates each NTP source based on:
@@ -19,12 +20,14 @@ A real-time terminal monitoring tool for `chrony` time synchronization, inspired
   - Standard deviation from `sourcestats`
   - Frequency skew stability
   - Stratum preference
+- **Reach visualization**: 8-bit binary display showing recent poll success history (newest→oldest)
 - **Network noise detection**: Compares selected source standard deviation against median to identify outlier conditions
 - **Poll interval tracking**: Displays current polling intervals for active sources
 - **Sourcestats integration**: Merges `chronyc sources -v` and `sourcestats -v` data for enriched analysis
 
 ### Health Monitoring
-- **Automated alerts**: Warns about large offsets, high jitter, excessive drift, oscillator instability
+- **Chronyd daemon monitoring**: Detects when chronyd is down or unreachable
+- **Automated alerts**: Warns about large offsets, high jitter, excessive drift, oscillator instability, no reachable/selected sources
 - **Time jump detection**: Identifies system time discontinuities and suspend/resume events
 - **Color-coded status**: Green/yellow/red indicators for quick health assessment
 
@@ -69,18 +72,23 @@ sudo ./chronytop.py
 
 **Controls:**
 - `q` - Quit
+- `a` - Toggle autoscaling for graphs (default: off, uses fixed scales)
 - Updates automatically every second
 
 ## How It Works
 
-ChronyTop polls three `chronyc` commands every second:
-1. `chronyc tracking` - System clock metrics
-2. `chronyc sources -v` - NTP source status and offsets
-3. `chronyc sourcestats -v` - Statistical analysis of sources
+ChronyTop intelligently polls `chronyc` commands with rate limiting to reduce overhead:
+1. `chronyc tracking` - Every 1 second (system clock metrics)
+2. `chronyc sources -v` - Every 5 seconds (NTP source status and offsets)
+3. `chronyc sourcestats -v` - Every 20 seconds (statistical analysis of sources)
+
+Results are cached between intervals. If a command fails, the previous successful result is retained and displayed with age information.
 
 It also reads CPU package temperatures from:
 - `/sys/class/hwmon/hwmon*/` (coretemp sensors, preferred)
 - `/sys/class/thermal/thermal_zone*/` (x86_pkg_temp fallback)
+
+If no temperature sensors are initially found, ChronyTop retries discovery every 60 seconds.
 
 ## Understanding the Display
 
@@ -95,6 +103,11 @@ Sources are scored based on multiple factors:
 - **80-100**: Excellent - Low jitter, good reachability, selected source
 - **55-79**: Fair - Some issues but usable
 - **0-54**: Poor - High jitter, unreachable, or stale
+
+**Reach Visualization**: 8 dots showing recent poll attempts (e.g., `●●●●○○○○`)
+- `●` = successful poll
+- `○` = failed poll
+- Left = newest, Right = oldest
 
 **Flags**:
 - `UNREACHABLE` - Cannot contact source
@@ -113,6 +126,10 @@ Compares the selected source's standard deviation against the median of all sour
 - **OUTLIER**: 3x median + 0.5ms gap (may indicate network issues)
 
 ### Health Alerts
+- **CHRONYD DOWN / NO DATA**: chronyd daemon not running or not responding
+- **NO SOURCES**: No NTP sources configured
+- **NO REACHABLE SOURCES**: All configured sources are unreachable
+- **NO SELECTED SOURCE**: chronyd hasn't selected a reference source
 - **CLOCK STEP / LARGE OFFSET**: Offset >50ms
 - **HIGH OFFSET**: Offset >10ms
 - **JITTER (RMS HIGH)**: RMS >10ms
@@ -120,6 +137,7 @@ Compares the selected source's standard deviation against the median of all sour
 - **UNSTABLE OSC (SKEW HIGH)**: Skew >5ppm
 - **TIME JUMP**: Large sudden offset change
 - **SUSPEND/PAUSE DETECTED**: Monotonic clock gap detected
+- **STALE DATA**: chronyc commands timing out or returning stale information
 
 ## Configuration
 
@@ -131,6 +149,29 @@ RMS_SCALE    = (0.000, 0.050)    # 0-50ms
 FREQ_SCALE   = (-100, 100)       # ±100ppm
 SKEW_SCALE   = (0, 20)           # 0-20ppm
 TEMP_SCALE   = (20.0, 90.0)      # 20-90°C
+```
+
+### Adjusting History Window## Configuration
+
+### Graph Scaling Modes
+
+**Fixed Scale (default)**: Press `a` to toggle. Uses predefined scales:
+```python
+OFFSET_SCALE = (-0.050, 0.050)   # ±50ms
+RMS_SCALE    = (0.000, 0.050)    # 0-50ms
+FREQ_SCALE   = (-100, 100)       # ±100ppm
+SKEW_SCALE   = (0, 20)           # 0-20ppm
+TEMP_SCALE   = (20.0, 90.0)      # 20-90°C
+```
+
+**Autoscale mode**: Press `a` to toggle. Dynamically adjusts scales based on recent data (2-minute window). Values exceeding the visible range are clipped and indicated with ▲ (above) or ▼ (below) symbols.
+
+### Adjusting Rate Limiting
+Edit these constants to change how often chronyc is called:
+```python
+TRACKING_REFRESH_S    = 1.0   # Track system clock every second
+SOURCES_REFRESH_S     = 5.0   # Poll sources every 5 seconds
+SOURCESTATS_REFRESH_S = 20.0  # Update sourcestats every 20 seconds
 ```
 
 ### Adjusting History Window
@@ -159,47 +200,44 @@ MAX_SRC_ROWS = 7  # Maximum sources shown in trust panel
 - Not all systems expose temperature sensors via sysfs
 - VMs typically don't have temperature sensors
 - Check manually: `cat /sys/class/hwmon/hwmon*/name`
-
-### Updates are too slow (17+ minutes)
-Your chrony polling interval is at maximum (1024s). To see more frequent updates:
-
-Edit `/etc/chrony/chrony.conf` and add to server lines:
-```
-server ntp.example.com iburst minpoll 4 maxpoll 6
-```
-
-Then restart: `sudo systemctl restart chronyd`
-
-This sets polling to 16-64 seconds instead of up to 1024 seconds.
+- ChronyTop automatically retries sensor discovery every 60 seconds, so if sensors appear later (e.g., after module loading), they'll be detected
 
 ## Performance Notes
 
-ChronyTop executes three `chronyc` commands per second. For most systems this is negligible overhead, but if you want to optimize:
+ChronyTop uses intelligent rate limiting to minimize overhead:
+- `chronyc tracking`: polled every 1 second (lightweight, essential)
+- `chronyc sources -v`: polled every 5 seconds (moderately expensive)
+- `chronyc sourcestats -v`: polled every 20 seconds (expensive, rarely changes)
 
-1. **Cache sourcestats**: The `sourcestats` data changes slowly and could be cached for 10-30 seconds
-2. **Reduce update frequency**: Change `time.sleep(1)` to `time.sleep(2)` for 2-second updates
-3. **Disable temperature monitoring**: Comment out the `poll_cpu_temps()` call if not needed
+Failed commands retain previous successful results, so transient issues don't disrupt the display.
+
+For extremely resource-constrained systems, you can:
+1. **Increase refresh intervals** in the configuration constants
+2. **Disable temperature monitoring**: Comment out `poll_cpu_temps()` call
+3. **Reduce update frequency**: Change `time.sleep(1)` to `time.sleep(2)` or higher
 
 ## Contributing
 
 Contributions welcome! Areas for improvement:
-- Auto-scaling graphs based on actual data ranges
-- Configuration file support
-- Export/logging capability
-- Additional chrony metrics
+- Auto-detect optimal graph scales based on system stability
+- Configuration file support (YAML/TOML)
+- Export/logging capability (JSON, CSV)
+- Additional chrony metrics (leap second status, kernel discipline)
+- Historical data replay mode
 - MacOS support (using different temp sensors)
 - Windows support (using w32time instead of chrony)
+- Color themes / customizable UI
 
 ## License
 
-MIT License - see LICENSE file for details
+GPLv2
 
 ## Author
 
-Created by [Your Name]
+Created by AimanA
 
 ## Acknowledgments
 
 - Inspired by `top`, `htop`, and similar system monitoring tools
-- Built for the `chrony` NTP implementation
+- Built for the `chrony` Linux NTP implementation
 - Thanks to the chrony project for excellent time synchronization software
