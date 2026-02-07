@@ -42,7 +42,7 @@ A real-time terminal monitoring tool for `chrony` time synchronization, inspired
 
 ```bash
 # Clone the repository
-git clone https://github.com/yourusername/chronytop.git
+git clone https://github.com/aimana007/ChronyTop.git
 cd chronytop
 
 # Make executable
