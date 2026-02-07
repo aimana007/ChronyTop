@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# timetop enhanced:
+# ChronyTop 2 enhanced:
 # - tracking + labeled graphs + health
 # - sources trust + poll interval + sourcestats + network noise
 # - CPU temp (coretemp sysfs) with robust fallbacks
