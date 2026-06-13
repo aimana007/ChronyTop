@@ -73,6 +73,8 @@ sudo ./chronytop.py
 **Controls:**
 - `q` - Quit
 - `a` - Toggle autoscaling for graphs (default: off, uses fixed scales)
+- `p` - Pause/resume data updates (graphs and stats freeze)
+- `h` / `?` - Show/hide the help overlay
 - Updates automatically every second
 
 ## How It Works
@@ -110,14 +112,16 @@ Sources are scored based on multiple factors:
 - Left = newest, Right = oldest
 
 **Flags**:
-- `UNREACHABLE` - Cannot contact source
-- `BAD` - Source marked bad by chrony
-- `TOO_VAR` - Too much variance
-- `STALE` - Haven't received update recently
+- `UNREACH` - Cannot contact source (`?` in M column)
+- `FALSETICKER` - Marked as a falseticker by chrony, providing inconsistent time (`x` in M column)
+- `TOO_VAR` - Too much variance (`~` in M column)
+- `NO_RCH` / `RCH=0` / `LOW_RCH` - Missing, zero, or low reach register
+- `NO_RX` / `AGING` / `STALE` - No, aging, or stale last-sample time
 - `OFF>Xms` - Offset exceeds threshold
+- `ERR>Xms` - Estimated error exceeds threshold
 - `SD>Xms` - Standard deviation too high
 - `FSKEW>X` - Frequency skew too high
-- `FALSETICKER?` - Likely providing incorrect time
+- `HI_STR` - Stratum is high (≥10)
 
 ### Network Noise Indicator
 Compares the selected source's standard deviation against the median of all sources:
@@ -216,13 +220,21 @@ For extremely resource-constrained systems, you can:
 2. **Disable temperature monitoring**: Comment out `poll_cpu_temps()` call
 3. **Reduce update frequency**: Change `time.sleep(1)` to `time.sleep(2)` or higher
 
+## Running Tests
+
+Unit tests cover the `chronyc` output parsers and trust/health scoring (stdlib `unittest`, no real terminal or chronyd needed):
+
+```bash
+python3 -m unittest discover -s python/tests -v
+```
+
 ## Contributing
 
 Contributions welcome! Areas for improvement:
 - Auto-detect optimal graph scales based on system stability
 - Configuration file support (YAML/TOML)
 - Export/logging capability (JSON, CSV)
-- Additional chrony metrics (leap second status, kernel discipline)
+- Additional chrony metrics (kernel discipline)
 - Historical data replay mode
 - MacOS support (using different temp sensors)
 - Windows support (using w32time instead of chrony)

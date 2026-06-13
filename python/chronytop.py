@@ -90,6 +90,21 @@ class TimeTop:
         # Graph scaling
         self.autoscale = False  # toggle with 'a' (default: fixed scales)
 
+        # Pause / help overlay
+        self.paused = False     # toggle with 'p' (freezes data updates)
+        self.show_help = False  # toggle with 'h' or '?'
+
+        # Last-known frame, reused while paused
+        self._last = {
+            "tracking_out": None,
+            "sources_out": None,
+            "ages": {"tracking": None, "sources -v": None, "sourcestats -v": None},
+            "temp_readings": [],
+            "temp_max": None,
+            "t": None,
+            "sources": [],
+        }
+
     # ---------- display helpers ----------
     def addn(self, y, x, s, attr=0, maxw=None):
         try:
@@ -729,7 +744,7 @@ class TimeTop:
             flags.append("UNREACH")
             score -= 55
         if "x" in ms:
-            flags.append("BAD")
+            flags.append("FALSETICKER")
             score -= 45
         if "~" in ms:
             flags.append("TOO_VAR")
@@ -826,7 +841,7 @@ class TimeTop:
 
         score = max(0.0, min(100.0, score))
 
-        if score >= 80 and ("UNREACH" not in flags) and ("BAD" not in flags):
+        if score >= 80 and ("UNREACH" not in flags) and ("FALSETICKER" not in flags):
             col = 1
         elif score >= 55:
             col = 2
@@ -1009,6 +1024,29 @@ class TimeTop:
                       "Legend: Poll=log2(seconds). Reach in octal. ReachBits shows newest(left)->oldest(right).",
                       curses.color_pair(6), width)
 
+    # ---------- help overlay ----------
+    def draw_help_overlay(self, h, w):
+        lines = [
+            "ChronyTop 2 - Keybindings",
+            "",
+            "  q        Quit",
+            "  a        Toggle graph autoscale (FIX/AUTO)",
+            "  p        Pause/resume data updates",
+            "  h, ?     Toggle this help",
+            "",
+            "  Press any key to close",
+        ]
+        box_w = min(w - 2, max(len(s) for s in lines) + 4)
+        box_h = min(h - 2, len(lines) + 2)
+        top = max(0, (h - box_h) // 2)
+        left = max(0, (w - box_w) // 2)
+
+        attr = curses.color_pair(5) | curses.A_BOLD
+        self.addn(top, left, "+" + "-" * (box_w - 2) + "+", attr, box_w)
+        for i, text in enumerate(lines[: box_h - 2]):
+            self.addn(top + 1 + i, left, "|" + text.ljust(box_w - 2) + "|", attr, box_w)
+        self.addn(top + box_h - 1, left, "+" + "-" * (box_w - 2) + "+", attr, box_w)
+
     # ---------- main loop ----------
     def run(self):
         while True:
@@ -1016,22 +1054,64 @@ class TimeTop:
             h, w = self.stdscr.getmaxyx()
 
             self.addn(0, 2, "ChronyTop 2", curses.color_pair(5) | curses.A_BOLD)
-            self.addn(1, 2, datetime.now().strftime("%F %T"))
+            clock = datetime.now().strftime("%F %T")
+            if self.paused:
+                clock += "  [PAUSED]"
+                self.addn(1, 2, clock, curses.color_pair(2) | curses.A_BOLD)
+            else:
+                self.addn(1, 2, clock)
 
-            tracking_out     = self.chronyc_cached("tracking")
-            sources_out      = self.chronyc_cached("sources -v")
-            sourcestats_out  = self.chronyc_cached("sourcestats -v")
+            if not self.paused:
+                tracking_out     = self.chronyc_cached("tracking")
+                sources_out      = self.chronyc_cached("sources -v")
+                sourcestats_out  = self.chronyc_cached("sourcestats -v")
 
-            ages = {
-                "tracking": self.chrony_age("tracking"),
-                "sources -v": self.chrony_age("sources -v"),
-                "sourcestats -v": self.chrony_age("sourcestats -v"),
-            }
+                ages = {
+                    "tracking": self.chrony_age("tracking"),
+                    "sources -v": self.chrony_age("sources -v"),
+                    "sourcestats -v": self.chrony_age("sourcestats -v"),
+                }
 
-            # CPU temps (sysfs)
-            temp_readings, temp_max = self.poll_cpu_temps()
-            if temp_max is not None:
-                self.temp_history.append(temp_max)
+                # CPU temps (sysfs)
+                temp_readings, temp_max = self.poll_cpu_temps()
+                if temp_max is not None:
+                    self.temp_history.append(temp_max)
+                elif int(time.monotonic()) % 60 == 0:
+                    self.temp_sources = self.discover_temp_sources()
+
+                if tracking_out is None and sources_out is None:
+                    t = None
+                    sources = []
+                else:
+                    t = self.parse_tracking(tracking_out) if (tracking_out and not self.chrony_out_is_error(tracking_out)) else None
+                    if t:
+                        self.offset_history.append(t["offset"])
+                        self.rms_history.append(t["rms"])
+                        self.freq_history.append(t["freq"])
+                        self.skew_history.append(t["skew"])
+
+                    sources = self.parse_sources_v(sources_out) if (sources_out and not self.chrony_out_is_error(sources_out)) else []
+                    ss_map  = self.parse_sourcestats_v(sourcestats_out) if (sourcestats_out and not self.chrony_out_is_error(sourcestats_out)) else {}
+                    self.merge_sourcestats(sources, ss_map)
+
+                self._last = {
+                    "tracking_out": tracking_out,
+                    "sources_out": sources_out,
+                    "ages": ages,
+                    "temp_readings": temp_readings,
+                    "temp_max": temp_max,
+                    "t": t,
+                    "sources": sources,
+                }
+
+            frame = self._last
+            tracking_out  = frame["tracking_out"]
+            sources_out   = frame["sources_out"]
+            ages          = frame["ages"]
+            temp_readings = frame["temp_readings"]
+            temp_max      = frame["temp_max"]
+            t             = frame["t"]
+            sources       = frame["sources"]
 
             if tracking_out is None and sources_out is None:
                 self.addn(3, 2, "ERROR: chronyc not found / not executable",
@@ -1041,17 +1121,6 @@ class TimeTop:
                 self.addn(5, 2, "Health: CHRONYD DOWN / NO DATA",
                           curses.color_pair(3) | curses.A_BOLD)
             else:
-                t = self.parse_tracking(tracking_out) if (tracking_out and not self.chrony_out_is_error(tracking_out)) else None
-                if t:
-                    self.offset_history.append(t["offset"])
-                    self.rms_history.append(t["rms"])
-                    self.freq_history.append(t["freq"])
-                    self.skew_history.append(t["skew"])
-
-                sources = self.parse_sources_v(sources_out) if (sources_out and not self.chrony_out_is_error(sources_out)) else []
-                ss_map  = self.parse_sourcestats_v(sourcestats_out) if (sourcestats_out and not self.chrony_out_is_error(sourcestats_out)) else {}
-                self.merge_sourcestats(sources, ss_map)
-
                 sel_name, poll_s = self.selected_poll_seconds(sources)
                 if poll_s is not None:
                     self.addn(2, 2,
@@ -1067,9 +1136,6 @@ class TimeTop:
 
                 # CPU temp line
                 if temp_max is None:
-                    now = time.monotonic()
-                    if int(now) % 60 == 0:
-                        self.temp_sources = self.discover_temp_sources()
                     self.addn(4, 2, "CPU Temp: - (no readable sensors)", curses.color_pair(2))
                 else:
                     parts = []
@@ -1164,16 +1230,28 @@ class TimeTop:
             self.divider(h - 2)
             self.addn(
                 h - 1, 2,
-                f"q=quit   a=autoscale({('ON' if self.autoscale else 'OFF')})   chronyc: tracking({TRACKING_REFRESH_S:.0f}s) sources({SOURCES_REFRESH_S:.0f}s) sourcestats({SOURCESTATS_REFRESH_S:.0f}s)   clip: ▲▼   reachbits: newest→oldest",
+                f"q=quit   a=autoscale({('ON' if self.autoscale else 'OFF')})   "
+                f"p=pause({('ON' if self.paused else 'OFF')})   h=help   "
+                f"chronyc: tracking({TRACKING_REFRESH_S:.0f}s) sources({SOURCES_REFRESH_S:.0f}s) sourcestats({SOURCESTATS_REFRESH_S:.0f}s)   clip: ▲▼   reachbits: newest→oldest",
                 curses.color_pair(6)
             )
 
+            if self.show_help:
+                self.draw_help_overlay(h, w)
+
             try:
                 c = self.stdscr.getch()
-                if c == ord("q"):
+                if self.show_help:
+                    if c != -1:
+                        self.show_help = False
+                elif c == ord("q"):
                     break
-                if c == ord("a"):
+                elif c == ord("a"):
                     self.autoscale = not self.autoscale
+                elif c == ord("p"):
+                    self.paused = not self.paused
+                elif c in (ord("h"), ord("?")):
+                    self.show_help = True
             except:
                 pass
 
