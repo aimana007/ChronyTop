@@ -116,7 +116,7 @@ class TimeTop:
     def run_chronyc(self, cmd, timeout=2):
         try:
             p = subprocess.run(
-                ["chronyc"] + cmd.split(),
+                ["chronyc", "-n"] + cmd.split(),
                 capture_output=True, text=True, timeout=timeout
             )
             if p.returncode != 0:
@@ -185,6 +185,14 @@ class TimeTop:
     def _search_float(self, out, pattern):
         m = re.search(pattern, out)
         return float(m.group(1)) if m else None
+
+    def _search_int(self, out, pattern):
+        m = re.search(pattern, out)
+        return int(m.group(1)) if m else None
+
+    def _search_str(self, out, pattern):
+        m = re.search(pattern, out)
+        return m.group(1).strip() if m else None
 
     def _normalize_name(self, name):
         if not name:
@@ -350,6 +358,12 @@ class TimeTop:
         for k in ("offset", "rms", "freq", "skew"):
             if data.get(k) is None:
                 data[k] = 0.0
+
+        data["stratum"]         = self._search_int(out, r"Stratum\s+:\s+(\d+)")
+        data["refid"]           = self._search_str(out, r"Reference ID\s+:\s+(.+)")
+        data["leap"]            = self._search_str(out, r"Leap status\s+:\s+(.+)")
+        data["root_delay"]      = self._search_float(out, r"Root delay\s+:\s+([-\d.]+)\s+seconds")
+        data["root_dispersion"] = self._search_float(out, r"Root dispersion\s+:\s+([-\d.]+)\s+seconds")
         return data
 
     # ---------- parse chronyc sources -v ----------
@@ -645,12 +659,20 @@ class TimeTop:
         return alerts
 
     # ---------- health ----------
-    def health(self, sources=None, ages=None):
+    def health(self, sources=None, ages=None, tracking=None):
         alerts = []
 
         # Chrony sync / daemon status first (high priority)
         if sources is not None and ages is not None:
             alerts.extend(self.chrony_sync_health(sources, ages))
+
+        # Leap status from tracking (high priority)
+        if tracking is not None:
+            leap = tracking.get("leap")
+            if leap == "Not synchronised":
+                alerts.append(("NOT SYNCHRONISED (chronyd reports unsynced)", 3))
+            elif leap in ("Insert second", "Delete second"):
+                alerts.append((f"LEAP SECOND PENDING: {leap}", 2))
 
         # Oscillator health only if we have tracking history
         if not self.offset_history:
@@ -1072,10 +1094,30 @@ class TimeTop:
                     self.addn(y + 1, lx, f"RMS:    {t['rms']*1000: .3f} ms", curses.color_pair(6))
                     self.addn(y + 2, lx, f"Freq:   {t['freq']:+.3f} ppm", curses.color_pair(6))
                     self.addn(y + 3, lx, f"Skew:   {t['skew']: .3f} ppm", curses.color_pair(6))
+
+                    stratum = t.get("stratum")
+                    stratum_s = str(stratum) if stratum is not None else "-"
+                    refid = t.get("refid") or "-"
+                    leap = t.get("leap") or "-"
+                    root_delay = t.get("root_delay")
+                    root_disp = t.get("root_dispersion")
+                    rd_s = fmt_ms(root_delay) if root_delay is not None else "-"
+                    rdisp_s = fmt_ms(root_disp) if root_disp is not None else "-"
+
+                    leap_col = 6
+                    if leap == "Not synchronised":
+                        leap_col = 3
+                    elif leap in ("Insert second", "Delete second"):
+                        leap_col = 2
+
+                    self.addn(y + 4, lx,
+                              f"Stratum: {stratum_s:<3} RefID: {refid:<22.22} "
+                              f"RootDelay: {rd_s:>10} RootDisp: {rdisp_s:>10} Leap: {leap}",
+                              curses.color_pair(leap_col))
                 else:
                     self.addn(y, lx, "No tracking data parsed.", curses.color_pair(3) | curses.A_BOLD)
 
-                gy = y + 5
+                gy = y + 6
                 self.addn(gy, lx, "Graphs", curses.color_pair(5) | curses.A_BOLD)
 
                 graph_w = max(40, min(w - lx - 2, 100))
@@ -1091,7 +1133,7 @@ class TimeTop:
                 hy = g0 + (10 if self.temp_history else 8)
                 self.addn(hy, lx, "Health", curses.color_pair(5) | curses.A_BOLD)
 
-                alerts = self.health(sources=sources, ages=ages)
+                alerts = self.health(sources=sources, ages=ages, tracking=t)
                 if not alerts:
                     self.addn(hy + 1, lx + 2, "OK", curses.color_pair(1) | curses.A_BOLD)
                 else:
