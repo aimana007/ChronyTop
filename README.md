@@ -8,7 +8,7 @@ A real-time terminal monitoring tool for `chrony` time synchronization, inspired
 
 ### Core Monitoring
 - **Real-time tracking metrics**: System time offset, RMS jitter, frequency drift, and skew
-- **Live sparkline graphs**: Visual representation of offset, RMS, frequency, and skew over time with optional autoscaling (toggle with `a`)
+- **Live sparkline graphs**: Visual representation of offset, RMS, frequency, and skew over time with optional autoscaling (toggle with `a`) and adjustable height (1-8 rows, `+`/`-`) for finer vertical resolution
 - **CPU temperature monitoring**: Tracks package temperatures via `coretemp` hwmon sensors with thermal zone fallback and automatic rediscovery
 - **Temperature-frequency coupling analysis**: Detects correlations between CPU temperature changes and clock drift
 - **Intelligent rate limiting**: Reduces chronyc overhead with cached results (tracking: 1s, sources: 5s, sourcestats: 20s)
@@ -74,6 +74,7 @@ sudo ./chronytop.py
 - `q` - Quit
 - `a` - Toggle autoscaling for graphs (default: off, uses fixed scales)
 - `p` - Pause/resume data updates (graphs and stats freeze)
+- `+` / `-` - Make graphs taller/shorter (1-8 rows, default 3; each row adds 8 levels of resolution, shrinks automatically on short terminals)
 - `h` / `?` - Show/hide the help overlay
 - Updates automatically every second
 

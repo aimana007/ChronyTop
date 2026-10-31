@@ -7,7 +7,7 @@ from collections import deque
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from chronytop import TimeTop
+from chronytop import TimeTop, spark_rows
 
 
 def make_timetop():
@@ -229,6 +229,10 @@ class ChronyOutIsErrorTests(unittest.TestCase):
     def test_normal_output_is_not_error(self):
         self.assertFalse(self.tt.chrony_out_is_error(TRACKING_SYNCED))
 
+    def test_number_containing_506_is_not_error(self):
+        out = TRACKING_SYNCED.replace("0.002224203", "0.000050612")
+        self.assertFalse(self.tt.chrony_out_is_error(out))
+
 
 class SourceTrustTests(unittest.TestCase):
     def setUp(self):
@@ -274,6 +278,61 @@ class SourceTrustTests(unittest.TestCase):
         self.assertEqual(col, 3)
 
 
+# Healthy sync at high poll intervals, where LastRx is legitimately in the hundreds
+SOURCES_HIGH_POLL = """MS Name/IP address         Stratum Poll Reach LastRx Last sample
+===============================================================================
+^* 193.163.204.113               2   9   377   283  -5861us[-5361us] +/-   20ms
+^+ 107.161.86.210                2  10   377   538  +3148us[+3640us] +/-   28ms
+^+ 23.150.41.123                 2  10   377    38m +8259us[+8259us] +/-   36ms
+^- 23.142.248.8                  2   6   377     5h +5847us[+6339us] +/-   47ms
+"""
+
+AGES_FRESH = {"tracking": 0.5, "sources -v": 1.0, "sourcestats -v": 2.0}
+
+
+class LastRxStalenessTests(unittest.TestCase):
+    def setUp(self):
+        self.tt = make_timetop()
+        self.sources = self.tt.parse_sources_v(SOURCES_HIGH_POLL)
+
+    def test_lastrx_units_parsed(self):
+        rx = [s["last_rx"] for s in self.sources]
+        self.assertEqual(rx, [283, 538, 38 * 60, 5 * 3600])
+        self.assertEqual(self.sources[2]["last_rx_raw"], "38m")
+
+    def test_span_years(self):
+        self.assertEqual(self.tt._parse_span_seconds("2y"), 2 * 365 * 86400.0)
+
+    def test_high_poll_lastrx_is_not_stale(self):
+        for s in self.sources[:2]:
+            _, flags, _ = self.tt.source_trust(s)
+            self.assertNotIn("STALE", flags)
+            self.assertNotIn("AGING", flags)
+
+    def test_aging_and_stale_relative_to_poll(self):
+        # poll 10 (1024s): 38m = 2280s > 2048s -> AGING
+        _, flags, _ = self.tt.source_trust(self.sources[2])
+        self.assertIn("AGING", flags)
+        # poll 6 (64s): 5h -> STALE
+        _, flags, _ = self.tt.source_trust(self.sources[3])
+        self.assertIn("STALE", flags)
+
+    def test_low_poll_thresholds_unchanged(self):
+        self.assertEqual(self.tt.rx_stale_limits({"poll": 6}), (128, 256))
+        self.assertEqual(self.tt.rx_stale_limits({"poll": None}), (128, 256))
+
+    def test_no_all_stale_alert_at_high_poll(self):
+        alerts = self.tt.chrony_sync_health(self.sources, AGES_FRESH)
+        self.assertFalse(any("ALL SOURCES STALE" in txt for txt, _ in alerts))
+        self.assertIn(("CHRONY SYNC: OK", 1), alerts)
+
+    def test_all_stale_alert_still_fires(self):
+        for s in self.sources:
+            s["last_rx"] = 10 * 86400
+        alerts = self.tt.chrony_sync_health(self.sources, AGES_FRESH)
+        self.assertTrue(any("ALL SOURCES STALE" in txt for txt, _ in alerts))
+
+
 class HealthLeapStatusTests(unittest.TestCase):
     def setUp(self):
         self.tt = make_timetop()
@@ -314,6 +373,62 @@ class HelperFunctionTests(unittest.TestCase):
         self.assertEqual(self.tt._normalize_name("foo.example.com"), "foo.example.com")
         self.assertEqual(self.tt._normalize_name(""), "")
         self.assertEqual(self.tt._normalize_name(None), "")
+
+
+class SparkRowsTests(unittest.TestCase):
+    SCALE = (0.0, 1.0)
+
+    def legacy_spark(self, data, width, scale):
+        """The original single-row algorithm, kept as a reference."""
+        minv, maxv = scale
+        chars = " ▁▂▃▄▅▆▇█"
+        ncols = min(width, len(data))
+        out = ""
+        for val in list(data)[len(data) - ncols:]:
+            if val < minv:
+                out += "▼"
+            elif val > maxv:
+                out += "▲"
+            else:
+                n = max(0, min(8, int((val - minv) / (maxv - minv) * 8)))
+                if val > minv and n == 0:
+                    n = 1
+                out += chars[n]
+        return out
+
+    def test_height_one_matches_legacy(self):
+        data = [-0.5, 0.0, 0.001, 0.2, 0.5, 0.875, 0.99, 1.0, 1.5]
+        self.assertEqual(spark_rows(data, 20, 1, self.SCALE), [self.legacy_spark(data, 20, self.SCALE)])
+
+    def test_multi_row_stacks_blocks(self):
+        rows = spark_rows([0.0, 0.5, 1.0], 10, 2, self.SCALE)
+        self.assertEqual(rows, [
+            "  █",   # top
+            " ██",   # bottom
+        ])
+
+    def test_multi_row_partial_top(self):
+        # 0.75 of 2 rows = 12/16 levels: bottom full, top half
+        rows = spark_rows([0.0, 0.75], 10, 2, self.SCALE)
+        self.assertEqual(rows, [" ▄", " █"])
+
+    def test_tiny_value_gets_visible_bar(self):
+        rows = spark_rows([0.0, 0.0001], 10, 3, self.SCALE)
+        self.assertEqual(rows[-1], " ▁")
+        self.assertEqual(rows[0], "  ")
+
+    def test_clip_markers(self):
+        rows = spark_rows([-1.0, 2.0], 10, 3, self.SCALE)
+        self.assertEqual(rows, [" ▲", " █", "▼█"])
+
+    def test_width_keeps_newest(self):
+        rows = spark_rows([0.0, 0.0, 1.0, 1.0], 2, 1, self.SCALE)
+        self.assertEqual(rows, ["██"])
+
+    def test_degenerate_inputs(self):
+        self.assertEqual(spark_rows([0.5], 10, 3, self.SCALE), [])
+        self.assertEqual(spark_rows([0.1, 0.2], 10, 3, (1.0, 1.0)), [])
+        self.assertEqual(spark_rows([0.1, 0.2], 0, 3, self.SCALE), [])
 
 
 if __name__ == "__main__":

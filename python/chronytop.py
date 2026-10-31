@@ -7,7 +7,7 @@
 # - reach visualization (8-bit dot bar)
 # - chronyd/sync health: detects daemon down + no reachable/selected sources
 
-import curses, subprocess, time, re, statistics, os, glob
+import curses, subprocess, time, re, statistics, os, glob, sys
 from collections import deque
 from datetime import datetime
 
@@ -18,6 +18,11 @@ SKEW_SCALE   = (0, 20)           # ppm (tracking skew)
 TEMP_SCALE   = (20.0, 90.0)      # °C (adjust if your environment differs)
 
 MAX_SRC_ROWS = 7
+
+# Sparkline height in terminal rows (each row adds 8 levels of resolution).
+# Adjustable at runtime with +/-; shrinks automatically on short terminals.
+GRAPH_HEIGHT     = 3
+GRAPH_HEIGHT_MAX = 8
 
 # Rate limiting for chronyc calls
 TRACKING_REFRESH_S    = 1.0
@@ -48,6 +53,39 @@ def window_stats(data, n=None):
         return (0.0, 0.0, 0.0)
     xs = list(data)[-n:] if n else list(data)
     return (min(xs), sum(xs) / len(xs), max(xs))
+
+
+def spark_rows(data, width, height, scale):
+    """Render the newest `width` samples as `height` rows of block characters.
+    Returns a list of strings, top row first. Each row contributes 8 levels,
+    so resolution is height*8. Out-of-range values show clip markers (▲/▼).
+    """
+    minv, maxv = scale
+    if width <= 0 or height <= 0 or len(data) < 2 or maxv <= minv:
+        return []
+
+    chars = " ▁▂▃▄▅▆▇█"
+    levels = height * 8
+    ncols = min(width, len(data))
+    start = len(data) - ncols
+
+    # Per column, one character per row (index 0 = bottom row)
+    cols = []
+    for i in range(ncols):
+        val = data[start + i]
+        if val < minv:
+            cols.append(["▼"] + [" "] * (height - 1))
+            continue
+        if val > maxv:
+            cols.append(["█"] * (height - 1) + ["▲"])
+            continue
+        n = int((val - minv) / (maxv - minv) * levels)
+        n = max(0, min(levels, n))
+        if val > minv and n == 0:
+            n = 1
+        cols.append([chars[max(0, min(8, n - r * 8))] for r in range(height)])
+
+    return ["".join(c[r] for c in cols) for r in reversed(range(height))]
 
 
 class TimeTop:
@@ -85,10 +123,14 @@ class TimeTop:
         curses.init_pair(6, curses.COLOR_WHITE,   -1)
 
         curses.curs_set(0)
-        self.stdscr.nodelay(1)
+
+        # Data is sampled once per tick; keypresses only trigger a redraw
+        self.tick_s = 1.0
+        self._next_tick = 0.0
 
         # Graph scaling
         self.autoscale = False  # toggle with 'a' (default: fixed scales)
+        self.graph_height = GRAPH_HEIGHT  # adjust with +/-
 
         # Pause / help overlay
         self.paused = False     # toggle with 'p' (freezes data updates)
@@ -116,7 +158,7 @@ class TimeTop:
             if maxw <= 0:
                 return
             self.stdscr.addnstr(y, x, s, maxw, attr)
-        except:
+        except Exception:
             pass
 
     def divider(self, y, ch="─"):
@@ -124,7 +166,7 @@ class TimeTop:
         if 0 <= y < h:
             try:
                 self.stdscr.hline(y, 0, ch, max(0, w - 1), curses.color_pair(6))
-            except:
+            except Exception:
                 pass
 
     # ---------- chrony runner ----------
@@ -137,7 +179,7 @@ class TimeTop:
             if p.returncode != 0:
                 return (p.stdout or "") + ("\n" + p.stderr if p.stderr else "")
             return p.stdout
-        except:
+        except Exception:
             return None
 
     def chrony_out_is_error(self, out):
@@ -149,7 +191,6 @@ class TimeTop:
         # chronyc typical daemon/socket errors
         needles = [
             "Cannot talk to daemon",
-            "506",
             "Could not open command socket",
             "Connection refused",
             "No such file or directory",
@@ -186,14 +227,14 @@ class TimeTop:
         try:
             with open(path, "r", encoding="utf-8", errors="ignore") as f:
                 return f.read().strip()
-        except:
+        except Exception:
             return None
 
     def read_int(self, path):
         try:
             with open(path, "r", encoding="utf-8", errors="ignore") as f:
                 return int(f.read().strip())
-        except:
+        except Exception:
             return None
 
     # ---------- parsing helpers ----------
@@ -229,7 +270,7 @@ class TimeTop:
     def _parse_span_seconds(self, s):
         if not s:
             return None
-        m = re.match(r"^(\d+)([smhd])?$", s.strip())
+        m = re.match(r"^(\d+)([smhdy])?$", s.strip())
         if not m:
             return None
         v = int(m.group(1))
@@ -244,7 +285,18 @@ class TimeTop:
             return float(v) * 3600.0
         if u == "d":
             return float(v) * 86400.0
+        if u == "y":
+            return float(v) * 365.0 * 86400.0
         return float(v)
+
+    def rx_stale_limits(self, src):
+        """(aging, stale) LastRx thresholds in seconds, relative to the source's
+        poll interval: aging after 2 missed polls, stale after 4. At poll 6 (64s)
+        that is 128s/256s; at poll 10 (1024s) it is 2048s/4096s.
+        """
+        poll = src.get("poll")
+        poll_s = 2 ** poll if poll is not None else 64
+        return 2 * poll_s, 4 * poll_s
 
     # ---------- reach visualization ----------
     def reach_dots(self, reach, newest_left=True):
@@ -410,22 +462,21 @@ class TimeTop:
 
             try:
                 stratum = int(parts[2])
-            except:
+            except Exception:
                 stratum = None
             try:
                 poll = int(parts[3])
-            except:
+            except Exception:
                 poll = None
 
             reach_raw = parts[4]
             try:
                 reach = int(reach_raw, 8) if re.match(r"^[0-7]+$", reach_raw) else None
-            except:
+            except Exception:
                 reach = None
-            try:
-                last_rx = int(parts[5])
-            except:
-                last_rx = None
+            # LastRx is plain seconds, or uses m/h/d/y once it gets large
+            span = self._parse_span_seconds(parts[5])
+            last_rx = int(span) if span is not None else None
 
             rest = " ".join(parts[6:])
             offset_s = None
@@ -446,6 +497,7 @@ class TimeTop:
                 "reach": reach,
                 "reach_octal": reach_raw,
                 "last_rx": last_rx,
+                "last_rx_raw": parts[5],
                 "offset_s": offset_s,
                 "err_s": err_s,
                 "ss_np": None,
@@ -486,22 +538,22 @@ class TimeTop:
 
             try:
                 np_ = int(parts[1])
-            except:
+            except Exception:
                 np_ = None
             try:
                 nr_ = int(parts[2])
-            except:
+            except Exception:
                 nr_ = None
 
             span_s = self._parse_span_seconds(parts[3])
 
             try:
                 freq_ppm = float(parts[4])
-            except:
+            except Exception:
                 freq_ppm = None
             try:
                 fskew_ppm = float(parts[5])
-            except:
+            except Exception:
                 fskew_ppm = None
 
             off_s = None
@@ -653,7 +705,7 @@ class TimeTop:
             if r is not None and r > 0:
                 reachable += 1
 
-            if rx is not None and rx <= 256:
+            if rx is not None and rx <= self.rx_stale_limits(s)[1]:
                 any_rx_recent = True
 
         # Hard failures
@@ -765,14 +817,15 @@ class TimeTop:
                 score -= 15
                 flags.append("LOW_RCH")
 
+        rx_aging, rx_stale = self.rx_stale_limits(src)
         if last_rx is None:
             score -= 10
             flags.append("NO_RX")
         else:
-            if last_rx > 256:
+            if last_rx > rx_stale:
                 score -= 25
                 flags.append("STALE")
-            elif last_rx > 64:
+            elif last_rx > rx_aging:
                 score -= 15
                 flags.append("AGING")
 
@@ -881,38 +934,11 @@ class TimeTop:
 
         return (mn, mx)
 
-    def spark(self, y, x, width, data, scale, attr=0):
-        if width <= 0 or len(data) < 2:
-            return
-        minv, maxv = scale
-        if maxv <= minv:
-            return
+    def spark(self, y, x, width, height, data, scale, attr=0):
+        for r, row in enumerate(spark_rows(data, width, height, scale)):
+            self.addn(y + r, x, row, attr, width)
 
-        chars = " ▁▂▃▄▅▆▇█"
-        ncols = min(width, len(data))
-        start = len(data) - ncols
-
-        for i in range(ncols):
-            val = data[start + i]
-
-            # Clip markers (show out-of-range values explicitly)
-            if val < minv:
-                ch = "▼"
-            elif val > maxv:
-                ch = "▲"
-            else:
-                n = int((val - minv) / (maxv - minv) * 8)
-                n = max(0, min(8, n))
-                if val > minv and n == 0:
-                    n = 1
-                ch = chars[n]
-
-            try:
-                self.stdscr.addstr(y, x + i, ch, attr)
-            except:
-                pass
-
-    def draw_graph(self, y, x, w, title, data, scale, unit="s", signed=False, color=4):
+    def draw_graph(self, y, x, w, height, title, data, scale, unit="s", signed=False, color=4):
         if not data:
             self.addn(y, x, f"{title}: no data", curses.color_pair(3) | curses.A_BOLD, w)
             return
@@ -944,7 +970,7 @@ class TimeTop:
         mode = "AUTO" if self.autoscale else "FIX"
         header = f"{title:<6} now:{now_s:>10}  min:{mn_s:>10}  max:{mx_s:>10}  {mode} scale:{sc_min}..{sc_max}"
         self.addn(y, x, header, curses.color_pair(6), w)
-        self.spark(y + 1, x, w, data, scale_used, attr=curses.color_pair(color))
+        self.spark(y + 1, x, w, height, data, scale_used, attr=curses.color_pair(color))
 
     # ---------- sources panel ----------
     def draw_sources_panel(self, top_y, left_x, width, height, sources):
@@ -990,7 +1016,7 @@ class TimeTop:
             reach = s.get("reach")
             reach_o = s.get("reach_octal") or "-"
             reach_bits = self.reach_dots(reach, newest_left=True)
-            rx = s.get("last_rx")
+            rx = s.get("last_rx_raw") or "-"
 
             off = s.get("offset_s")
             err = s.get("err_s")
@@ -1008,7 +1034,7 @@ class TimeTop:
                 f"{(poll if poll is not None else '-'):>4} "
                 f"{reach_o:>4} "
                 f"{reach_bits:<8} "
-                f"{(rx if rx is not None else '-'):>4} "
+                f"{rx:>4} "
                 f"{(f'{off_ms:+.2f}' if off_ms is not None else '-'):>9} "
                 f"{(f'{err_ms:.2f}' if err_ms is not None else '-'):>9} "
                 f"{(f'{sd_ms:.2f}' if sd_ms is not None else '-'):>7} "
@@ -1032,6 +1058,7 @@ class TimeTop:
             "  q        Quit",
             "  a        Toggle graph autoscale (FIX/AUTO)",
             "  p        Pause/resume data updates",
+            "  +, -     Taller/shorter graphs",
             "  h, ?     Toggle this help",
             "",
             "  Press any key to close",
@@ -1061,7 +1088,12 @@ class TimeTop:
             else:
                 self.addn(1, 2, clock)
 
-            if not self.paused:
+            now_m = time.monotonic()
+            tick = now_m >= self._next_tick
+            if tick:
+                self._next_tick = now_m + self.tick_s
+
+            if tick and not self.paused:
                 tracking_out     = self.chronyc_cached("tracking")
                 sources_out      = self.chronyc_cached("sources -v")
                 sourcestats_out  = self.chronyc_cached("sourcestats -v")
@@ -1189,14 +1221,24 @@ class TimeTop:
                 graph_w = max(40, min(w - lx - 2, 100))
                 g0 = gy + 1
 
-                self.draw_graph(g0 + 0,  lx, graph_w, "Offset", self.offset_history, OFFSET_SCALE, unit="s",   signed=True)
-                self.draw_graph(g0 + 2,  lx, graph_w, "RMS",    self.rms_history,    RMS_SCALE,    unit="s",   signed=False)
-                self.draw_graph(g0 + 4,  lx, graph_w, "Freq",   self.freq_history,   FREQ_SCALE,   unit="ppm", signed=True)
-                self.draw_graph(g0 + 6,  lx, graph_w, "Skew",   self.skew_history,   SKEW_SCALE,   unit="ppm", signed=False)
+                graphs = [
+                    ("Offset", self.offset_history, OFFSET_SCALE, "s",   True),
+                    ("RMS",    self.rms_history,    RMS_SCALE,    "s",   False),
+                    ("Freq",   self.freq_history,   FREQ_SCALE,   "ppm", True),
+                    ("Skew",   self.skew_history,   SKEW_SCALE,   "ppm", False),
+                ]
                 if self.temp_history:
-                    self.draw_graph(g0 + 8, lx, graph_w, "Temp", self.temp_history, TEMP_SCALE, unit="c", signed=False)
+                    graphs.append(("Temp", self.temp_history, TEMP_SCALE, "c", False))
 
-                hy = g0 + (10 if self.temp_history else 8)
+                # Shrink graphs if needed so Health (4 rows) + footer (2) still fit
+                fit = (h - g0 - 6) // len(graphs) - 1
+                gh = max(1, min(self.graph_height, fit))
+
+                for i, (title, data, scale, unit, signed) in enumerate(graphs):
+                    self.draw_graph(g0 + i * (gh + 1), lx, graph_w, gh, title, data, scale,
+                                    unit=unit, signed=signed)
+
+                hy = g0 + len(graphs) * (gh + 1)
                 self.addn(hy, lx, "Health", curses.color_pair(5) | curses.A_BOLD)
 
                 alerts = self.health(sources=sources, ages=ages, tracking=t)
@@ -1231,7 +1273,7 @@ class TimeTop:
             self.addn(
                 h - 1, 2,
                 f"q=quit   a=autoscale({('ON' if self.autoscale else 'OFF')})   "
-                f"p=pause({('ON' if self.paused else 'OFF')})   h=help   "
+                f"p=pause({('ON' if self.paused else 'OFF')})   +/-=height({self.graph_height})   h=help   "
                 f"chronyc: tracking({TRACKING_REFRESH_S:.0f}s) sources({SOURCES_REFRESH_S:.0f}s) sourcestats({SOURCESTATS_REFRESH_S:.0f}s)   clip: ▲▼   reachbits: newest→oldest",
                 curses.color_pair(6)
             )
@@ -1239,6 +1281,9 @@ class TimeTop:
             if self.show_help:
                 self.draw_help_overlay(h, w)
 
+            self.stdscr.refresh()
+            wait_ms = int(max(0.0, self._next_tick - time.monotonic()) * 1000)
+            self.stdscr.timeout(wait_ms)
             try:
                 c = self.stdscr.getch()
                 if self.show_help:
@@ -1250,14 +1295,18 @@ class TimeTop:
                     self.autoscale = not self.autoscale
                 elif c == ord("p"):
                     self.paused = not self.paused
+                elif c in (ord("+"), ord("=")):
+                    self.graph_height = min(GRAPH_HEIGHT_MAX, self.graph_height + 1)
+                elif c in (ord("-"), ord("_")):
+                    self.graph_height = max(1, self.graph_height - 1)
                 elif c in (ord("h"), ord("?")):
                     self.show_help = True
-            except:
+            except Exception:
                 pass
-
-            self.stdscr.refresh()
-            time.sleep(1)
 
 
 if __name__ == "__main__":
-    curses.wrapper(lambda s: TimeTop(s).run())
+    try:
+        curses.wrapper(lambda s: TimeTop(s).run())
+    except KeyboardInterrupt:
+        sys.exit(130)

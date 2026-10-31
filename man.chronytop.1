@@ -57,6 +57,11 @@ adjust based on recent data (2-minute window). When disabled (default), uses
 fixed scales: ±50ms offset, 0-50ms RMS, ±100ppm frequency, 0-20ppm skew,
 20-90°C temperature. Values exceeding visible range are clipped and indicated
 with ▲ (above) or ▼ (below) symbols.
+.TP
+.B +, -
+Increase or decrease graph height (1-8 rows, default 3). Each row adds 8
+levels of vertical resolution. Graphs shrink automatically if the terminal
+is too short to fit them.
 
 .SH DISPLAY SECTIONS
 
